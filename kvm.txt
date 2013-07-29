@@ -1,0 +1,6 @@
+Enable KVM debugging :
+
+mount -t debugfs none /sys/kernel/debug
+echo 1 >/sys/kernel/debug/tracing/events/kvm/enable
+cat /sys/kernel/debug/tracing/trace_pipe
+
