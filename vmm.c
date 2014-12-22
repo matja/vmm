@@ -110,7 +110,7 @@ KVMVM *KVMHost_createVM(KVMHost *self)
 	// check if we need to set TSS (Intel bug)
 	kvm_ioctl = ioctl(self->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_SET_TSS_ADDR);
 	if (kvm_ioctl) {
-		vm_ioctl = ioctl(vm->vm_fd, KVM_SET_TSS_ADDR, 0xfffbd000);
+		vm_ioctl = ioctl(vm->vm_fd, KVM_SET_TSS_ADDR, 0xffffd000ULL);
 		if (vm_ioctl < 0) {
 			perror("KVM_SET_TSS_ADDR");
 			return NULL;
@@ -132,7 +132,7 @@ KVMVM *KVMHost_createVM(KVMHost *self)
 		return NULL;
 	}
 
-	// setup vm memory space
+	// allocate guest memory
 	int_result = posix_memalign((void **)&vm->ram, 1 << vm->ram_align_bits, vm->ram_size);
 	if (int_result != 0) {
 		perror("posix_memalign");
@@ -142,12 +142,27 @@ KVMVM *KVMHost_createVM(KVMHost *self)
 	// clear memory
 	memset(vm->ram, 0, vm->ram_size);
 
+	// map memory
 	memset(&umr, 0, sizeof(umr));
 	umr.slot = 0;
 	umr.flags = 0;
-	umr.guest_phys_addr = 0x0;
+	umr.guest_phys_addr = 0;
 	umr.memory_size = vm->ram_size;
-	umr.userspace_addr = (unsigned long)vm->ram;
+	umr.userspace_addr = (uint64_t)vm->ram;
+
+	vm_ioctl = ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, &umr);
+	if (vm_ioctl < 0) {
+		perror("KVM_SET_USER_MEMORY_REGION");
+		return NULL;
+	}
+
+	// map BIOS to BIST entry address
+	memset(&umr, 0, sizeof(umr));
+	umr.slot = 1;
+	umr.flags = 0;
+	umr.guest_phys_addr = 0xffff0000;
+	umr.memory_size     = 0x10000;
+	umr.userspace_addr  = (uint64_t)((char *)vm->ram + 0xf0000);
 
 	vm_ioctl = ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, &umr);
 	if (vm_ioctl < 0) {
@@ -163,6 +178,7 @@ int KVMVM_createVCPU(KVMVM *self)
 	int vm_ioctl;
 	int vcpu_ioctl;
 	struct local_apic lapic;
+	struct kvm_regs regs;
 
 	// create VCPU for this VM
 	vm_ioctl = ioctl(self->vm_fd, KVM_CREATE_VCPU, 0);
@@ -223,7 +239,8 @@ int KVMVM_mapControl(KVMVM *self)
 	mmap_size = vm_ioctl;
 
 	// get a pointer to the vcpu control structure
-	self->kvm_run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, self->vcpu_fd, 0);
+	self->kvm_run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+		self->vcpu_fd, 0);
 	if (self->kvm_run == MAP_FAILED) {
 		perror("mmap kvm vcpu");
 		return 0;
@@ -305,46 +322,53 @@ static void dump_vcpu_sregs(const struct kvm_sregs *r)
 // r->interrupt_bitmap
 }
 
-int KVMVM_reset(KVMVM *self)
+int KVMVM_resetProtectedMode(KVMVM *self)
 {
 	struct kvm_regs r;
 	struct kvm_sregs sr;
 	int vm_ioctl;
 	int vcpu_ioctl;
 
-	// seems to not be needed, kvm sets a valid (?) initial state.
-	return 1;
-
 	memset(&r, 0, sizeof(r));
 	memset(&sr, 0, sizeof(sr));
 
-	r.rdx = 0x623; // CPUID
-	r.rip = 0xfff0;
+	vcpu_ioctl = ioctl(self->vcpu_fd, KVM_GET_REGS, &r);
+	if (vcpu_ioctl < 0) {
+		perror("ioctl");
+		printf("%s: failed to sget regs\n", __func__);
+		return 0;
+	}
 
-	sr.cs.base = 0xffff0000;
-	sr.cs.limit = 0xffff;
-	sr.cs.selector = 0xf000;
-	sr.cs.type = 3;
-	sr.cs.present = 1;
-	sr.cs.dpl = 0;
-	sr.cs.s = 0;
-	sr.cs.l = 0;
+	r.rflags = 0x2;
+	r.rip = 0x00000000;
+
+	sr.cs.base = 0;
+	sr.cs.limit = 0xffffffff;
 	sr.cs.g = 1;
-	sr.cs.avl = 1;
+	sr.cs.db = 1;
 
-	sr.cr0 = 0x60000010;
-	sr.apic_base = 0xfee00000;
+	sr.ds.base  = sr.cs.base;
+	sr.ds.limit = sr.cs.limit;
+	sr.ds.g     = sr.cs.g;
+	sr.ds.db    = sr.cs.db;	
+
+	sr.es.base  = sr.cs.base;
+	sr.es.limit = sr.cs.limit;
+	sr.es.g     = sr.cs.g;
+	sr.es.db    = sr.cs.db;
+
+	sr.ss.base  = sr.cs.base;
+	sr.ss.limit = sr.cs.limit;
+	sr.ss.g     = sr.cs.g;
+	sr.ss.db    = sr.cs.db;		
+
+	sr.cr0 = 0x60000011;
+	//sr.apic_base = 0xfee00000;
 
 	vcpu_ioctl = ioctl(self->vcpu_fd, KVM_SET_REGS, &r);
 	if (vcpu_ioctl < 0) {
 		perror("ioctl");
 		printf("%s: failed to set regs\n", __func__);
-		return 0;	}
-
-	vcpu_ioctl = ioctl(self->vcpu_fd, KVM_SET_SREGS, &sr);
-	if (vcpu_ioctl < 0) {
-		perror("ioctl");
-		printf("%s: failed to set sregs\n", __func__);
 		return 0;
 	}
 
@@ -425,6 +449,7 @@ int KVMVM_loadBIOS(KVMVM *self, const char *bios_filename)
 		return 0;
 	}
 
+	/* BIOS must be exactly 64kiB at the moment */
 	fread(((char *)self->ram) + 0xf0000, 0x10000, 1, file);
 	fclose(file);
 
@@ -495,6 +520,7 @@ int main(void)
 	KVMHost *kvm = NULL;
 	KVMVM *vm = NULL;
 	int result = 0;
+	int enter_pmode = 0;
 
 	// create KVM context
 	kvm = KVMHost_create();
@@ -515,11 +541,14 @@ int main(void)
 	}
 
 	KVMVM_loadBIOS(vm, "bios.bin");
-
 	KVMVM_createVCPU(vm);
 	KVMVM_mapControl(vm);
 
-	//KVMVM_reset(vm);
+	if (enter_pmode) {
+		/* go directly into pmode */
+		KVMVM_resetProtectedMode(vm);
+	}
+	
 	KVMVM_dumpRegisters(vm);
 
 	KVMVM_run(vm);

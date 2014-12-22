@@ -2,17 +2,18 @@ bits 16
 org 0
 
 main:
+	; disable interrupts
+	cli
+
 	; setup stack
 	mov ax,0x9000
 	mov ss,ax
 	mov sp,0xfffe
 
+	; setup modules
 	call ints_init
 	call serial_init
 	call parallel_init
-
-	call boot
-
 	call break
 
 boot:
@@ -216,6 +217,8 @@ int_16_02:
 int_16_03:
 	ret
 
+padding_break:
+	times 0x8000-($-$$) db 0x90
 
 break:
 	out dx,ax
@@ -224,7 +227,7 @@ padding_entry:
 	times 0xfff0-($-$$) db 0
 
 entry:
-	jmp 0xf000:0
+	jmp main
 
 date:
 	db "20130128"
@@ -237,3 +240,4 @@ machine_type:
 
 unknown:
 	db 0
+
